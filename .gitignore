@@ -1,0 +1,46 @@
+# ----------------------
+# IDE / Editor
+# ----------------------
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ----------------------
+# Environment / virtualenv
+# ----------------------
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ----------------------
+# Distribution / packaging
+# ----------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ----------------------
+# OS files
+# ----------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# Logs / temp
+# ----------------------
+*.log
+*.tmp
+*.swp
