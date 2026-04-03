@@ -44,3 +44,10 @@ Thumbs.db
 *.log
 *.tmp
 *.swp
+
+# ----------------------
+# Additional stuff
+# ----------------------
+
+debug_list_of_downloads
+crawled_docs/

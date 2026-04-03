@@ -145,7 +145,7 @@ def download_and_convert(
         f.write(markdown)
 
     import os
-    file_size_kb = й.path.getsize(output_file) / 1024
+    file_size_kb = os.path.getsize(output_file) / 1024
     print(f"Готово: {output_file} ({len(markdown)} символов, {file_size_kb:.2f} KB)")
     return markdown
 
