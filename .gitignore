@@ -50,4 +50,4 @@ Thumbs.db
 # ----------------------
 
 debug_list_of_downloads
-crawled_docs/
+# crawled_docs/
