@@ -1,15 +1,22 @@
+"""
+Documentation web crawler.
+Downloads HTML pages following links within configured URL boundaries,
+saves them locally preserving path structure, and produces a manifest
+for subsequent conversion to a single MD file.
+"""
 
 import os
+import time
 import hashlib
 import logging
 from urllib.parse import urljoin, urlparse, urldefrag
 from pathlib import Path
 from dataclasses import dataclass, field
 from collections import deque
+from crawl_stat import CrawlStats, StatLevel
 
 import requests
 from bs4 import BeautifulSoup
-from tqdm import tqdm
 
 logging.basicConfig(
     filename="crawler.log",
@@ -21,51 +28,40 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CrawlConfig:
-    """Конфигурация краулера."""
-    # Стартовая страница
+    """Crawler configuration."""
     start_url: str
-    # Директория для сохранения
     output_dir: str = "crawled_docs"
-    # Максимальная глубина обхода (от стартовой страницы)
-    max_depth: int = 5
-    # Скачивать ли картинки/диаграммы
+    max_depth: int = 50
     download_assets: bool = True
-    # Расширения картинок, которые считаем полезными
     asset_extensions: tuple = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
-    # Допустимые расширения для страниц (пустое = любые html-подобные)
     page_extensions: tuple = (".html", ".htm", "")
-    # Таймаут запроса
     timeout: int = 30
-    # Задержка между запросами (секунды) — чтобы не ddos-ить
     delay: float = 0.2
-    # User-Agent
     user_agent: str = "DocCrawler/1.0"
+    additional_boundaries: list = field(default_factory=list)
+    exclude_patterns: list = field(default_factory=list)
 
 
 @dataclass
 class CrawledPage:
-    """Результат скачивания одной страницы."""
+    """Single downloaded page with metadata."""
     url: str
-    # Локальный путь относительно output_dir
     local_path: str
-    # Заголовок страницы
     title: str = ""
-    # Ссылки на другие страницы (url -> local_path)
     outgoing_links: dict = field(default_factory=dict)
-    # Ассеты (url -> local_path)
     assets: dict = field(default_factory=dict)
     depth: int = 0
 
 
 class DocCrawler:
     """
-    Краулер для документации.
+    Documentation crawler (BFS).
 
-    Ключевые решения:
-    - Уникальность: по нормализованному URL (без фрагмента #...)
-    - Границы: остаёмся в пределах "базового пути" стартового URL
-    - Структура на диске повторяет структуру URL-путей
-    - Каждая страница знает свои исходящие ссылки → потом легко линковать в MD
+    Tracks:
+    - Page uniqueness via normalized URL set
+    - URL boundaries (primary prefix + additional allowed prefixes)
+    - Local path structure mirroring original URLs
+    - Outgoing links per page for later MD cross-referencing
     """
 
     def __init__(self, config: CrawlConfig):
@@ -73,95 +69,127 @@ class DocCrawler:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.user_agent})
 
-        # Множество уже посещённых URL (нормализованных)
         self.visited: set[str] = set()
-        # url → CrawledPage для всех скачанных страниц
         self.pages: dict[str, CrawledPage] = {}
-        # url → local_path для всех скачанных ассетов
         self.assets: dict[str, str] = {}
 
-        # Определяем "границу" краулинга — prefix URL
+        # Primary boundary: parent directory of start URL
         parsed = urlparse(config.start_url)
-        # Берём путь до последнего "/" как базу
         base_path = parsed.path
         if not base_path.endswith("/"):
             base_path = base_path.rsplit("/", 1)[0] + "/"
-        self.url_boundary = f"{parsed.scheme}://{parsed.netloc}{base_path}"
+        self.primary_boundary = f"{parsed.scheme}://{parsed.netloc}{base_path}"
 
-        # DEBUG START
-        self.links_downloaded = 0
-        self.download_decisions: list[str] = []
-        # DEBUG END
+        # Additional boundaries (other allowed URL prefixes)
+        self.boundaries: list[str] = [self.primary_boundary]
+        for boundary in config.additional_boundaries:
+            if not boundary.startswith(("http://", "https://")):
+                boundary = f"https://{boundary}"
+            self.boundaries.append(boundary)
 
-        logger.info(f"Crawl boundary: {self.url_boundary}")
+        logger.info(f"Crawl boundaries: {self.boundaries}")
 
-        # Создаём корневую директорию
         Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
+        self.stats = CrawlStats(
+            active_levels=StatLevel.PROGRESS | StatLevel.LINKS | StatLevel.DEPTH,
+            log_every_n=1,
+            control_dir=config.output_dir,
+        )
+
     def normalize_url(self, url: str) -> str:
-        """Убираем фрагмент (#section), trailing слеши для консистентности."""
+        """Strip fragment (#section) for deduplication."""
         url, _ = urldefrag(url)
-        # Убираем trailing slash только если это не директория-index
         return url
 
     def is_in_scope(self, url: str) -> bool:
-        """Проверяем, что URL в пределах нашей документации."""
-        return url.startswith(self.url_boundary)
+        """Check if URL falls within allowed boundaries and not excluded."""
+        for pattern in self.config.exclude_patterns:
+            if pattern in url:
+                return False
+
+        for boundary in self.boundaries:
+            if url.startswith(boundary):
+                return True
+        return False
 
     def url_to_local_path(self, url: str, is_asset: bool = False) -> str:
         """
-        Преобразуем URL в локальный путь.
+        Convert URL to local file path.
 
-        https://example.com/docs/project/guide/intro.html
-        → docs/project/guide/intro.html
-
-        Сохраняем структуру — это критично для линковки потом.
+        Includes hostname to avoid cross-domain collisions.
+        Paths without extension become dir/index.html to prevent
+        file/directory name conflicts.
         """
         parsed = urlparse(url)
+
+        netloc = parsed.netloc.replace(":", "_").replace("@", "_")
         path = parsed.path
 
-        # Убираем ведущий слеш
         if path.startswith("/"):
             path = path[1:]
 
-        # Если путь пустой или заканчивается на "/", добавляем index.html
-        if not path or path.endswith("/"):
-            path = path + "index.html"
+        full_path = f"{netloc}/{path}" if path else netloc
 
-        # Если нет расширения и это не ассет — предполагаем .html
-        if not is_asset and "." not in Path(path).name:
-            path = path + ".html"
+        if is_asset:
+            return full_path
 
-        return path
+        if full_path.endswith("/"):
+            return f"{full_path}index.html"
 
-    def download_page(self, url: str) -> str | None:
-        """Скачиваем HTML-страницу, возвращаем текст или None."""
+        path_obj = Path(full_path)
+        ext = path_obj.suffix.lower()
+
+        if ext in (".html", ".htm"):
+            return full_path
+        elif ext and ext in self.config.asset_extensions:
+            return full_path
+        else:
+            return f"{full_path}/index.html"
+
+    def download_page(self, url: str) -> tuple[str | None, requests.Response | None, str]:
+        """
+        Download an HTML page.
+        Returns (html_text, response, final_url) or (None, response_or_none, url).
+        final_url reflects the URL after any redirects.
+        """
         try:
-            import time
             time.sleep(self.config.delay)
             resp = self.session.get(url, timeout=self.config.timeout)
             resp.raise_for_status()
 
+            final_url = resp.url
             content_type = resp.headers.get("content-type", "")
-            if "text/html" not in content_type and "application/xhtml" not in content_type:
-                logger.debug(f"Skipping non-HTML: {url} (content-type: {content_type})")
-                return None
 
-            return resp.text
+            was_redirect = len(resp.history) > 0
+            redirect_url = resp.url if was_redirect else ""
+            self.stats.record_response(
+                content_type=content_type,
+                was_redirect=was_redirect,
+                redirect_url=redirect_url,
+            )
+
+            if "text/html" not in content_type and "application/xhtml" not in content_type:
+                self.stats.record_skip(url, f"non-HTML: {content_type}")
+                logger.debug(f"Skipping non-HTML: {url} (content-type: {content_type})")
+                return None, resp, final_url
+
+            return resp.text, resp, final_url
+
         except requests.RequestException as e:
+            self.stats.record_skip(url, str(e))
             logger.warning(f"Failed to download {url}: {e}")
-            return None
+            return None, None, url
 
     def download_asset(self, url: str) -> bool:
-        """Скачиваем бинарный ассет (картинку). Возвращаем успех."""
+        """Download a binary asset (image). Returns success."""
         if url in self.assets:
-            return True  # уже скачан
+            return True
 
         local_path = self.url_to_local_path(url, is_asset=True)
         full_path = Path(self.config.output_dir) / local_path
 
         try:
-            import time
             time.sleep(self.config.delay / 2)
 
             resp = self.session.get(url, timeout=self.config.timeout, stream=True)
@@ -175,34 +203,44 @@ class DocCrawler:
             self.assets[url] = local_path
             logger.info(f"  Asset saved: {local_path}")
             return True
+
         except requests.RequestException as e:
             logger.warning(f"Failed to download asset {url}: {e}")
             return False
 
     def extract_links(self, soup: BeautifulSoup, page_url: str) -> list[str]:
-        """Извлекаем ссылки на другие страницы документации."""
-        links = []
-        for a_tag in soup.find_all("a", href=True):
+        """Extract in-scope documentation links from page HTML."""
+        all_hrefs = soup.find_all("a", href=True)
+        total_found = len(all_hrefs)
+
+        in_scope_links = []
+        for a_tag in all_hrefs:
             href = a_tag["href"]
 
-            # Пропускаем якоря, javascript, mailto
             if href.startswith(("#", "javascript:", "mailto:")):
                 continue
 
             absolute_url = urljoin(page_url, href)
             normalized = self.normalize_url(absolute_url)
-
             if self.is_in_scope(normalized):
-                links.append(normalized)
-                self.download_decisions.append(normalized) # debug
+                in_scope_links.append(normalized)
 
-        return links
+        new_count = sum(1 for u in in_scope_links if u not in self.visited)
+        dup_count = len(in_scope_links) - new_count
+
+        self.stats.record_links(
+            found=total_found,
+            in_scope=len(in_scope_links),
+            new=new_count,
+            duplicate=dup_count,
+        )
+
+        return in_scope_links
 
     def extract_assets(self, soup: BeautifulSoup, page_url: str) -> list[str]:
-        """Извлекаем ссылки на картинки и SVG."""
+        """Extract image and SVG asset URLs from page HTML."""
         asset_urls = []
 
-        # <img src="...">
         for img_tag in soup.find_all("img", src=True):
             src = img_tag["src"]
             absolute_url = urljoin(page_url, src)
@@ -211,7 +249,6 @@ class DocCrawler:
             if ext in self.config.asset_extensions:
                 asset_urls.append(absolute_url)
 
-        # <object data="..."> (часто используется для SVG в доках)
         for obj_tag in soup.find_all("object", data=True):
             data = obj_tag["data"]
             absolute_url = urljoin(page_url, data)
@@ -222,68 +259,75 @@ class DocCrawler:
 
         return asset_urls
 
-    def save_html(self, html: str, local_path: str) -> None:
-        """Сохраняем HTML на диск."""
+    def save_html(self, html: str, local_path: str, url: str) -> bool:
+        """Save HTML content to disk. Returns success."""
         full_path = Path(self.config.output_dir) / local_path
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(full_path, "w", encoding="utf-8") as f:
-            f.write(html)
+
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            return True
+        except OSError as e:
+            logger.error(f"Failed to save {url} -> {full_path}: {e}")
+            return False
 
     def crawl(self) -> dict[str, CrawledPage]:
         """
-        Основной цикл краулинга (BFS).
-
-        Возвращает словарь url → CrawledPage со всей мета-информацией
-        для последующей конвертации и линковки.
+        Main BFS crawl loop.
+        Returns dict of url -> CrawledPage with all metadata
+        needed for conversion and cross-linking.
         """
-        queue: deque[tuple[str, int]] = deque()  # (url, depth)
+        queue: deque[tuple[str, int]] = deque()
         start_normalized = self.normalize_url(self.config.start_url)
         queue.append((start_normalized, 0))
         self.visited.add(start_normalized)
 
-        pbar = tqdm(total=None, unit="page", desc="Crawling docs", ascii=True) # debug
-
         while queue:
             url, depth = queue.popleft()
+            self.stats.update_queue_size(len(queue))
 
             if depth > self.config.max_depth:
-                print(f"exceeded depth of {self.config.max_depth}")
+                self.stats.record_skip(url, f"max_depth exceeded ({depth})")
                 continue
 
-            logger.info(f"[depth={depth}] Crawling: {url}")
+            self.stats.begin_page(url=url, depth=depth)
 
-            html = self.download_page(url)
+            html, resp, final_url = self.download_page(url)
             if html is None:
+                self.stats.end_page(html_size=0)
                 continue
 
-            pbar.update(1) # debug
-            pbar.set_postfix({"queue": len(queue)}) # debug
+            # Mark redirected URL as visited to avoid re-downloading
+            if final_url != url:
+                self.visited.add(self.normalize_url(final_url))
 
             soup = BeautifulSoup(html, "html.parser")
+            local_path = self.url_to_local_path(final_url)
 
-            # Определяем локальный путь
-            local_path = self.url_to_local_path(url)
-
-            # Заголовок страницы
             title_tag = soup.find("title")
             title = title_tag.get_text(strip=True) if title_tag else ""
 
-            # Создаём запись о странице
-            page = CrawledPage(
-                url=url,
-                local_path=local_path,
-                title=title,
-                depth=depth,
-            )
+            page = CrawledPage(url=final_url, local_path=local_path, title=title, depth=depth)
 
-            # Извлекаем и скачиваем ассеты
+            self.stats.record_structure(soup)
+
+            # Extract and download assets
             if self.config.download_assets:
-                for asset_url in self.extract_assets(soup, url):
-                    if self.download_asset(asset_url):
+                asset_urls = self.extract_assets(soup, final_url)
+                downloaded = 0
+                cached = 0
+                for asset_url in asset_urls:
+                    if asset_url in self.assets:
+                        cached += 1
                         page.assets[asset_url] = self.assets[asset_url]
+                    elif self.download_asset(asset_url):
+                        downloaded += 1
+                        page.assets[asset_url] = self.assets[asset_url]
+                self.stats.record_assets(found=len(asset_urls), downloaded=downloaded, cached=cached)
 
-            # Извлекаем ссылки
-            child_links = self.extract_links(soup, url)
+            # Extract links and enqueue new ones
+            child_links = self.extract_links(soup, final_url)
             for link_url in child_links:
                 link_local = self.url_to_local_path(link_url)
                 page.outgoing_links[link_url] = link_local
@@ -292,30 +336,26 @@ class DocCrawler:
                     self.visited.add(link_url)
                     queue.append((link_url, depth + 1))
 
-            # Сохраняем HTML
-            self.save_html(html, local_path)
-            self.pages[url] = page
+            # Save page to disk
+            if not self.save_html(html, local_path, final_url):
+                self.stats.record_skip(final_url, "failed to save HTML")
+                self.stats.end_page(html_size=0)
+                continue
 
-            logger.info(
-                f"  Saved: {local_path} | "
-                f"Links: {len(page.outgoing_links)} | "
-                f"Assets: {len(page.assets)}"
-                f"Queue length: {len(queue)}"
-            )
+            self.pages[final_url] = page
+            self.stats.end_page(html_size=len(html.encode("utf-8")))
 
-        logger.info(f"Crawling complete. Pages: {len(self.pages)}, Assets: {len(self.assets)}")
-        # DEBUG START
-        pbar.close()
-        import json
-        with open("debug_list_of_downloads", "w", encoding="utf-8") as f:
-            json.dump(self.download_decisions, f, indent=2, ensure_ascii=False)
-        # DEBUG END
+        print(self.stats.summary())
+        self.stats.dump_snapshot(
+            str(Path(self.config.output_dir) / "crawl_stats.json")
+        )
+
         return self.pages
 
     def save_manifest(self, path: str | None = None) -> None:
         """
-        Сохраняем манифест — JSON с информацией о всех страницах и связях.
-        Это понадобится для этапа конвертации в MD с линковкой.
+        Save manifest JSON with all pages, links and assets.
+        Used by the converter for cross-page linking in the final MD file.
         """
         import json
 
@@ -324,7 +364,7 @@ class DocCrawler:
 
         manifest = {
             "start_url": self.config.start_url,
-            "boundary": self.url_boundary,
+            "boundary": self.primary_boundary,
             "pages": {},
             "assets": self.assets,
         }
@@ -344,7 +384,6 @@ class DocCrawler:
         logger.info(f"Manifest saved: {path}")
 
 
-# тестим
 if __name__ == "__main__":
     config = CrawlConfig(
         start_url="https://shiro.apache.org/documentation.html",
@@ -352,6 +391,7 @@ if __name__ == "__main__":
         max_depth=10,
         download_assets=True,
         delay=0.3,
+        additional_boundaries=["https://javadoc.io/doc/org.apache.shiro"],
     )
 
     crawler = DocCrawler(config)
