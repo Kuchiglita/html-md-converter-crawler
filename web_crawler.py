@@ -18,6 +18,8 @@ from crawl_stat import CrawlStats, StatLevel
 import requests
 from bs4 import BeautifulSoup
 
+from generator_detector import DocTypeDetector
+
 logging.basicConfig(
     filename="crawler.log",
     level=logging.INFO,
@@ -52,6 +54,8 @@ class CrawledPage:
     outgoing_links: dict = field(default_factory=dict)
     assets: dict = field(default_factory=dict)
     depth: int = 0
+    generator: str = "unknown"
+    selector: str = ""
 
 
 class DocCrawler:
@@ -97,6 +101,8 @@ class DocCrawler:
             log_every_n=1,
             control_dir=config.output_dir,
         )
+
+        self.detector = DocTypeDetector()
 
     def normalize_url(self, url: str) -> str:
         """Strip fragment (#section and ? queries) for deduplication."""
@@ -309,6 +315,7 @@ class DocCrawler:
                 self.visited.add(self.normalize_url(final_url))
 
             soup = BeautifulSoup(html, "html.parser")
+            detection = self.detector.detect(html, url)
             local_path = self.url_to_local_path(final_url)
 
             title_tag = soup.find("title")
@@ -319,7 +326,9 @@ class DocCrawler:
                 original_url=raw_url,
                 local_path=local_path,
                 title=title,
-                depth=depth
+                depth=depth,
+                generator = detection.generator_name,
+                selector = detection.content_selector
             )
 
             self.stats.record_structure(soup)
@@ -388,6 +397,8 @@ class DocCrawler:
                 "original_url": page.original_url,
                 "title": page.title,
                 "depth": page.depth,
+                "generator": page.generator,
+                "selector": page.selector,
                 "outgoing_links": page.outgoing_links,
                 "assets": page.assets,
             }

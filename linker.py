@@ -325,11 +325,20 @@ class DocumentationConverter:
                 # Если вдруг ассета нет в манифесте (пропустили при скачивании)
                 logger.warning(f"Asset not found in manifest: {normalized_abs_url}")
 
-    def _extract_main_content(self, soup: BeautifulSoup) -> Optional[Tag]:
+    def _extract_main_content(self, soup: BeautifulSoup, page_info: dict) -> Optional[Tag]:
         """Extract page body, stripping only scripts and styles."""
         for el in soup.select('script, style'):
             el.decompose()
 
+        specific_selector = page_info.get("selector")
+        if specific_selector:
+            content = soup.select_one(specific_selector)
+            if content:
+                text_len = len(content.get_text(strip=True))
+                if text_len >= self.config.min_content_length:
+                    return content
+
+        # fallback
         selectors = [
             ('main', {}),
             ('article', {}),
@@ -371,7 +380,7 @@ class DocumentationConverter:
 
         return ul
 
-    def convert_page(self, local_path: str, url: str, title: str) -> tuple[Optional[str], str]:
+    def convert_page(self, local_path: str, url: str, title: str, page_info: dict) -> tuple[Optional[str], str]:
         """Convert a single HTML page to MD. Returns (markdown, skip_reason)."""
         full_path = self.docs_dir / local_path  # auto concat with the right slash, depending on the OS
 
@@ -390,7 +399,7 @@ class DocumentationConverter:
         self._fix_internal_links(soup, url, page_id)
         self._fix_image_paths(soup, local_path)
 
-        content = self._extract_main_content(soup)
+        content = self._extract_main_content(soup, page_info)
         if not content:
             return None, "no main content found"
 
@@ -446,7 +455,12 @@ class DocumentationConverter:
                 skip_reasons["excluded by pattern"] += 1
                 continue
 
-            md_content, reason = self.convert_page(local_path, url, title)
+            md_content, reason = self.convert_page(
+                page_info["local_path"],
+                url,
+                page_info.get("title", ""),
+                page_info
+            )
 
             if md_content:
                 converted.append({
