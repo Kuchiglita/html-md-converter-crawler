@@ -58,6 +58,8 @@ class CrawledPage:
     selector: str = ""
 
 
+from playwright.sync_api import sync_playwright
+
 class DocCrawler:
     """
     Documentation crawler (BFS).
@@ -71,8 +73,17 @@ class DocCrawler:
 
     def __init__(self, config: CrawlConfig):
         self.config = config
+
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.user_agent})
+
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(headless=True)
+        self.context = self.browser.new_context(user_agent=config.user_agent)
+        self.browser_page = self.context.new_page()
+
+        self.context = self.browser.new_context(user_agent=config.user_agent)
+        self.page = self.context.new_page()
 
         self.visited: set[str] = set()
         self.pages: dict[str, CrawledPage] = {}
@@ -156,7 +167,7 @@ class DocCrawler:
         else:
             return f"{full_path}/index.html"
 
-    def download_page(self, url: str) -> tuple[str | None, requests.Response | None, str]:
+    def download_page(self, url: str) -> tuple[str | None, str]:
         """
         Download an HTML page.
         Returns (html_text, response, final_url) or (None, response_or_none, url).
@@ -164,31 +175,34 @@ class DocCrawler:
         """
         try:
             time.sleep(self.config.delay)
-            resp = self.session.get(url, timeout=self.config.timeout)
-            resp.raise_for_status()
+            # go by URL
+            response = self.page.goto(url, wait_until="networkidle", timeout=self.config.timeout * 1000)
 
-            final_url = resp.url
-            content_type = resp.headers.get("content-type", "")
+            if not response or not response.ok:
+                self.stats.record_skip(url, f"Status: {response.status if response else 'No Response'}")
+                return None, url
 
-            was_redirect = len(resp.history) > 0
-            redirect_url = resp.url if was_redirect else ""
+            final_url = self.browser_page.url
+            content_type = response.headers.get("content-type", "")
+
+            was_redirect = final_url != url
             self.stats.record_response(
                 content_type=content_type,
                 was_redirect=was_redirect,
-                redirect_url=redirect_url,
+                redirect_url=final_url if was_redirect else ""
             )
 
             if "text/html" not in content_type and "application/xhtml" not in content_type:
                 self.stats.record_skip(url, f"non-HTML: {content_type}")
-                logger.debug(f"Skipping non-HTML: {url} (content-type: {content_type})")
-                return None, resp, final_url
+                # logger.debug(f"Skipping non-HTML: {url} (content-type: {content_type})")
+                return None, final_url
 
-            return resp.text, resp, final_url
+            return self.browser_page.content(), final_url
 
         except requests.RequestException as e:
             self.stats.record_skip(url, str(e))
             logger.warning(f"Failed to download {url}: {e}")
-            return None, None, url
+            return None, url
 
     def download_asset(self, url: str) -> bool:
         """Download a binary asset (image). Returns success."""
@@ -281,6 +295,13 @@ class DocCrawler:
             logger.error(f"Failed to save {url} -> {full_path}: {e}")
             return False
 
+    def close(self):
+        """Clean up Playwright resources."""
+        self.browser_page.close()
+        self.context.close()
+        self.browser.close()
+        self.playwright.stop()
+
     def crawl(self) -> dict[str, CrawledPage]:
         """
         Main BFS crawl loop.
@@ -305,7 +326,7 @@ class DocCrawler:
 
             self.stats.begin_page(url=url, depth=depth, original_url=raw_url)
 
-            html, resp, final_url = self.download_page(url)
+            html, final_url = self.download_page(url)
             if html is None:
                 self.stats.end_page(html_size=0)
                 continue
@@ -411,24 +432,27 @@ class DocCrawler:
 
 if __name__ == "__main__":
     config = CrawlConfig(
-        start_url="https://dlcdn.apache.org/karaf/documentation/4_x.html",
-        output_dir="crawled_docs/dlcdn",
-        max_depth=10,
+        start_url="https://inlong.apache.org/docs/introduction",
+        output_dir="crawled_docs/inlong",
+        max_depth=100,
         download_assets=True,
-        delay=0.3,
+        delay=0.5,
         #additional_boundaries=["https://javadoc.io/doc/org.apache.shiro"],
     )
 
     crawler = DocCrawler(config)
-    pages = crawler.crawl()
-    crawler.save_manifest()
+    try:
+        pages = crawler.crawl()
+        crawler.save_manifest()
+    finally:
+        crawler.close()
 
-    print(f"\n{'=' * 60}")
-    print(f"Crawled {len(pages)} pages")
-    print(f"Downloaded {len(crawler.assets)} assets")
-    print(f"\nPages by depth:")
-    from collections import Counter
-
-    depth_counts = Counter(p.depth for p in pages.values())
-    for d in sorted(depth_counts):
-        print(f"  depth {d}: {depth_counts[d]} pages")
+    # print(f"\n{'=' * 60}")
+    # print(f"Crawled {len(pages)} pages")
+    # print(f"Downloaded {len(crawler.assets)} assets")
+    # print(f"\nPages by depth:")
+    # from collections import Counter
+    #
+    # depth_counts = Counter(p.depth for p in pages.values())
+    # for d in sorted(depth_counts):
+    #     print(f"  depth {d}: {depth_counts[d]} pages")

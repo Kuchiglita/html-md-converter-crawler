@@ -102,6 +102,7 @@ class DocTypeDetector:
             "docbook": {
                 "priority": 95,
                 "content_selector": "div.book, div.chapter, div.section, div.article",
+                "markup_type": "xml",
                 "rules": [
                     {"type": "meta", "key": "generator", "pattern": r"DocBook XSL", "weight": 100},
                     # unique DocBook XSL markers (the most trustful)
