@@ -7,6 +7,9 @@ from bs4 import BeautifulSoup, Tag
 from markdownify import MarkdownConverter
 from typing import Optional
 from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -295,21 +298,32 @@ class DocumentationConverter:
                     else:
                         a['href'] = f"#{target_page_id}"
 
-    def _fix_image_paths(self, soup: BeautifulSoup, current_local_path: str):
-        """Make image src paths relative to docs_dir."""
-        current_dir = Path(current_local_path).parent
+    def _fix_image_paths(self, soup: BeautifulSoup, current_page_url: str):
+        """
+        Global Rebasing:
+        Makes all image paths relative to the final single MD file (root).
+        """
+        # Taking assets map from manifest: { "abs_url": "local_path" }
+        asset_manifest = self.manifest.get("assets", {})
 
-        for img in soup.find_all('img', src=True):
-            src = img['src']
+        for img in soup.find_all(['img', 'object'], src=True) + soup.find_all('object', data=True):
+            attr = 'src' if img.name == 'img' else 'data'
+            raw_src = img.get(attr)
 
-            if src.startswith(('http://', 'https://', 'data:')):
+            if not raw_src or raw_src.startswith(('http://', 'https://', 'data:')):
                 continue
 
-            if src.startswith('/'):
-                img['src'] = src[1:]
+            abs_url = urljoin(current_page_url, raw_src)  # get absolute url of the asset
+            normalized_abs_url = re.sub(r'\?.*$', '', abs_url).split('#')[0]  # normalize it
+
+            # find a local path in the manifest
+            if normalized_abs_url in asset_manifest:
+                local_path = asset_manifest[normalized_abs_url]
+                # since md is in root, path is just local path
+                img[attr] = local_path
             else:
-                resolved = (current_dir / src).as_posix()
-                img['src'] = str(Path(resolved)).replace('\\', '/')
+                # Если вдруг ассета нет в манифесте (пропустили при скачивании)
+                logger.warning(f"Asset not found in manifest: {normalized_abs_url}")
 
     def _extract_main_content(self, soup: BeautifulSoup) -> Optional[Tag]:
         """Extract page body, stripping only scripts and styles."""
@@ -359,7 +373,7 @@ class DocumentationConverter:
 
     def convert_page(self, local_path: str, url: str, title: str) -> tuple[Optional[str], str]:
         """Convert a single HTML page to MD. Returns (markdown, skip_reason)."""
-        full_path = self.docs_dir / local_path
+        full_path = self.docs_dir / local_path  # auto concat with the right slash, depending on the OS
 
         if not full_path.exists():
             return None, "file not found"
@@ -396,6 +410,13 @@ class DocumentationConverter:
         markdown = re.sub(r'\n{3,}', '\n\n', markdown).strip()
 
         if not markdown or len(markdown) < 50:
+            logger.warning(
+                f"Conversion failure or suspiciously short content:\n"
+                f"  - URL: {url}\n"
+                f"  - Local Path: {local_path}\n"
+                f"  - Length: {len(markdown) if markdown else 0} chars\n"
+                f"  - Page Title: {title}"
+            )
             return None, f"too short after conversion ({len(markdown)} chars)"
 
         page_title = title or Path(local_path).stem.replace('-', ' ').title()

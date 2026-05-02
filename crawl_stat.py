@@ -33,6 +33,7 @@ class PageStats:
     """Per-page statistics."""
     url: str
     depth: int
+    original_url: str = ""
     html_size_bytes: int = 0
     num_links_found: int = 0
     num_links_in_scope: int = 0
@@ -196,7 +197,7 @@ class CrawlStats:
 
     # --- Per-page lifecycle ---
 
-    def begin_page(self, url: str, depth: int):
+    def begin_page(self, url: str, depth: int, original_url: str = ""):
         """Call before starting to process a page."""
         self._current_start_time = time.time()
         self._current_page = PageStats(url=url, depth=depth)

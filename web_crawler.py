@@ -45,7 +45,8 @@ class CrawlConfig:
 @dataclass
 class CrawledPage:
     """Single downloaded page with metadata."""
-    url: str
+    url: str  # normalized url
+    original_url: str  # original url
     local_path: str
     title: str = ""
     outgoing_links: dict = field(default_factory=dict)
@@ -98,9 +99,11 @@ class DocCrawler:
         )
 
     def normalize_url(self, url: str) -> str:
-        """Strip fragment (#section) for deduplication."""
-        url, _ = urldefrag(url)
-        return url
+        """Strip fragment (#section and ? queries) for deduplication."""
+        parsed = urlparse(url)
+        if parsed.query:
+            logger.info(f"Query string detected and stripped: '?{parsed.query}' from {url}")
+        return parsed._replace(query="", fragment="").geturl()
 
     def is_in_scope(self, url: str) -> bool:
         """Check if URL falls within allowed boundaries and not excluded."""
@@ -208,12 +211,12 @@ class DocCrawler:
             logger.warning(f"Failed to download asset {url}: {e}")
             return False
 
-    def extract_links(self, soup: BeautifulSoup, page_url: str) -> list[str]:
+    def extract_links(self, soup: BeautifulSoup, page_url: str) -> list[tuple[str, str]]:
         """Extract in-scope documentation links from page HTML."""
         all_hrefs = soup.find_all("a", href=True)
         total_found = len(all_hrefs)
 
-        in_scope_links = []
+        results = []
         for a_tag in all_hrefs:
             href = a_tag["href"]
 
@@ -223,41 +226,41 @@ class DocCrawler:
             absolute_url = urljoin(page_url, href)
             normalized = self.normalize_url(absolute_url)
             if self.is_in_scope(normalized):
-                in_scope_links.append(normalized)
+                results.append((normalized, absolute_url))
 
-        new_count = sum(1 for u in in_scope_links if u not in self.visited)
-        dup_count = len(in_scope_links) - new_count
+        in_scope_normalized = [r[0] for r in results]
+        new_count = sum(1 for u in in_scope_normalized if u not in self.visited)
 
         self.stats.record_links(
             found=total_found,
-            in_scope=len(in_scope_links),
+            in_scope=len(results),
             new=new_count,
-            duplicate=dup_count,
+            duplicate=len(results) - new_count,
         )
 
-        return in_scope_links
+        return results
 
     def extract_assets(self, soup: BeautifulSoup, page_url: str) -> list[str]:
         """Extract image and SVG asset URLs from page HTML."""
         asset_urls = []
 
-        for img_tag in soup.find_all("img", src=True):
-            src = img_tag["src"]
-            absolute_url = urljoin(page_url, src)
-            parsed = urlparse(absolute_url)
-            ext = Path(parsed.path).suffix.lower()
-            if ext in self.config.asset_extensions:
-                asset_urls.append(absolute_url)
+        tags_attrs = [("img", "src"), ("object", "data")]
 
-        for obj_tag in soup.find_all("object", data=True):
-            data = obj_tag["data"]
-            absolute_url = urljoin(page_url, data)
-            parsed = urlparse(absolute_url)
-            ext = Path(parsed.path).suffix.lower()
-            if ext in self.config.asset_extensions:
-                asset_urls.append(absolute_url)
+        for tag_name, attr in tags_attrs:
+            for tag in soup.find_all(tag_name, **{attr: True}):
+                raw_url = tag[attr]
+                if raw_url.startswith('data:'): continue  # skip base64
 
-        return asset_urls
+                absolute_url = urljoin(page_url, raw_url)
+                # normalize: cut off ?queries and #anchors
+                normalized_url = self.normalize_url(absolute_url)
+
+                parsed = urlparse(normalized_url)
+                ext = Path(parsed.path).suffix.lower()
+                if ext in self.config.asset_extensions:
+                    asset_urls.append(normalized_url)
+
+        return list(set(asset_urls))
 
     def save_html(self, html: str, local_path: str, url: str) -> bool:
         """Save HTML content to disk. Returns success."""
@@ -278,20 +281,23 @@ class DocCrawler:
         Returns dict of url -> CrawledPage with all metadata
         needed for conversion and cross-linking.
         """
-        queue: deque[tuple[str, int]] = deque()
-        start_normalized = self.normalize_url(self.config.start_url)
-        queue.append((start_normalized, 0))
-        self.visited.add(start_normalized)
+        queue: deque[tuple[str, int, str]] = deque()
+
+        start_raw = self.config.start_url
+        start_norm = self.normalize_url(start_raw)
+
+        queue.append((start_norm, 0, start_raw))
+        self.visited.add(start_norm)
 
         while queue:
-            url, depth = queue.popleft()
+            url, depth, raw_url = queue.popleft()
             self.stats.update_queue_size(len(queue))
 
             if depth > self.config.max_depth:
                 self.stats.record_skip(url, f"max_depth exceeded ({depth})")
                 continue
 
-            self.stats.begin_page(url=url, depth=depth)
+            self.stats.begin_page(url=url, depth=depth, original_url=raw_url)
 
             html, resp, final_url = self.download_page(url)
             if html is None:
@@ -308,7 +314,13 @@ class DocCrawler:
             title_tag = soup.find("title")
             title = title_tag.get_text(strip=True) if title_tag else ""
 
-            page = CrawledPage(url=final_url, local_path=local_path, title=title, depth=depth)
+            page = CrawledPage(
+                url=final_url,
+                original_url=raw_url,
+                local_path=local_path,
+                title=title,
+                depth=depth
+            )
 
             self.stats.record_structure(soup)
 
@@ -328,13 +340,13 @@ class DocCrawler:
 
             # Extract links and enqueue new ones
             child_links = self.extract_links(soup, final_url)
-            for link_url in child_links:
-                link_local = self.url_to_local_path(link_url)
-                page.outgoing_links[link_url] = link_local
+            for link_norm, link_raw in child_links:
+                link_local = self.url_to_local_path(link_norm)
+                page.outgoing_links[link_norm] = link_local
 
-                if link_url not in self.visited:
-                    self.visited.add(link_url)
-                    queue.append((link_url, depth + 1))
+                if link_norm not in self.visited:
+                    self.visited.add(link_norm)
+                    queue.append((link_norm, depth + 1, link_raw))
 
             # Save page to disk
             if not self.save_html(html, local_path, final_url):
@@ -358,11 +370,12 @@ class DocCrawler:
         Used by the converter for cross-page linking in the final MD file.
         """
         import json
+        from typing import Any
 
         if path is None:
             path = str(Path(self.config.output_dir) / "manifest.json")
 
-        manifest = {
+        manifest: dict[str, Any] = {
             "start_url": self.config.start_url,
             "boundary": self.primary_boundary,
             "pages": {},
@@ -372,6 +385,7 @@ class DocCrawler:
         for url, page in self.pages.items():
             manifest["pages"][url] = {
                 "local_path": page.local_path,
+                "original_url": page.original_url,
                 "title": page.title,
                 "depth": page.depth,
                 "outgoing_links": page.outgoing_links,
@@ -386,12 +400,12 @@ class DocCrawler:
 
 if __name__ == "__main__":
     config = CrawlConfig(
-        start_url="https://shiro.apache.org/documentation.html",
-        output_dir="crawled_docs/shiro",
+        start_url="https://dlcdn.apache.org/karaf/documentation/4_x.html",
+        output_dir="crawled_docs/dlcdn",
         max_depth=10,
         download_assets=True,
         delay=0.3,
-        additional_boundaries=["https://javadoc.io/doc/org.apache.shiro"],
+        #additional_boundaries=["https://javadoc.io/doc/org.apache.shiro"],
     )
 
     crawler = DocCrawler(config)
