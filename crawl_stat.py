@@ -65,13 +65,6 @@ class CrawlStats:
         stats.end_page(html_size=len(html))
         stats.log()
         stats.dump_snapshot("stats.json")
-
-    Interactive control:
-        - SIGUSR1 signal: toggle verbose (Unix only)
-        - SIGUSR2 signal: dump snapshot (Unix only)
-        - Create file _dump_stats in control_dir: dump snapshot and delete file
-        - Create file _verbose_on / _verbose_off: switch levels
-        - Create file _set_levels_PROGRESS_LINKS: set specific levels
     """
 
     def __init__(

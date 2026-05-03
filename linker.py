@@ -306,6 +306,10 @@ class DocumentationConverter:
         # Taking assets map from manifest: { "abs_url": "local_path" }
         asset_manifest = self.manifest.get("assets", {})
 
+        base_url = current_page_url
+        if not base_url.startswith(('http://', 'https://')):
+            base_url = 'https://' + base_url
+
         for img in soup.find_all(['img', 'object'], src=True) + soup.find_all('object', data=True):
             attr = 'src' if img.name == 'img' else 'data'
             raw_src = img.get(attr)
@@ -313,17 +317,26 @@ class DocumentationConverter:
             if not raw_src or raw_src.startswith(('http://', 'https://', 'data:')):
                 continue
 
-            abs_url = urljoin(current_page_url, raw_src)  # get absolute url of the asset
-            normalized_abs_url = re.sub(r'\?.*$', '', abs_url).split('#')[0]  # normalize it
+            abs_url = urljoin(base_url, raw_src)  # get absolute url of the asset
+            parsed = urlparse(abs_url)
+            normalized_key = parsed._replace(query="", fragment="").geturl()
 
             # find a local path in the manifest
-            if normalized_abs_url in asset_manifest:
-                local_path = asset_manifest[normalized_abs_url]
-                # since md is in root, path is just local path
-                img[attr] = local_path
+            if normalized_key in asset_manifest:
+                img[attr] = asset_manifest[normalized_key]
+            elif abs_url in asset_manifest:
+                img[attr] = asset_manifest[abs_url]
             else:
-                # Если вдруг ассета нет в манифесте (пропустили при скачивании)
-                logger.warning(f"Asset not found in manifest: {normalized_abs_url}")
+                key_no_protocol = normalized_key.replace('https://', '').replace('http://', '')
+                found = False
+                for manifest_url, local_path in asset_manifest.items():
+                    if manifest_url.endswith(key_no_protocol):
+                        img[attr] = local_path
+                        found = True
+                        break
+
+                if not found:
+                    logger.warning(f"Asset not found in manifest: {normalized_key} (Page: {current_page_url})")
 
     def _extract_main_content(self, soup: BeautifulSoup, page_info: dict) -> Optional[Tag]:
         """Extract page body, stripping only scripts and styles."""

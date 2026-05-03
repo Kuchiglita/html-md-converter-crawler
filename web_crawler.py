@@ -73,6 +73,8 @@ class DocCrawler:
 
     def __init__(self, config: CrawlConfig):
         self.config = config
+        if not config.start_url.startswith(('http://', 'https://')):
+            config.start_url = 'https://' + config.start_url
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.user_agent})
@@ -459,53 +461,3 @@ class DocCrawler:
             json.dump(manifest, f, indent=2, ensure_ascii=False)
 
         logger.info(f"Manifest saved: {path}")
-
-
-if __name__ == "__main__":
-    config = CrawlConfig(
-        start_url="https://johnzon.apache.org/index.html",
-        output_dir="crawled_docs/johnzon",
-        max_depth=100,
-        download_assets=True,
-        delay=0.5,
-        exclude_patterns=[
-            "/apidocs/",  # Самое тяжелое — JavaDoc
-            "/testapidocs/",  # JavaDoc тестов
-            "/xref/",  # Исходный код в HTML
-            "/xref-test/",  # Исходный код тестов
-            "/cobertura/",  # Отчеты о покрытии тестами
-            "/checkstyle",  # Отчеты о качестве кода
-            "/pmd",  # Статический анализ
-            "/dependencies.html",
-            "/dependency-info.html",
-            "/project-info.html",
-            "/project-reports.html",
-            "/plugin-management.html",
-            "/plugins.html",
-            "/team-list.html",
-            "/source-repository.html",
-            "/issue-tracking.html",
-            "/license.html",
-            "/mail-lists.html",
-            "/distribution-management.html",
-            "/summary.html"
-        ],
-        #additional_boundaries=["https://javadoc.io/doc/org.apache.shiro"],
-    )
-
-    crawler = DocCrawler(config)
-    try:
-        pages = crawler.crawl()
-        crawler.save_manifest()
-    finally:
-        crawler.close()
-
-    # print(f"\n{'=' * 60}")
-    # print(f"Crawled {len(pages)} pages")
-    # print(f"Downloaded {len(crawler.assets)} assets")
-    # print(f"\nPages by depth:")
-    # from collections import Counter
-    #
-    # depth_counts = Counter(p.depth for p in pages.values())
-    # for d in sorted(depth_counts):
-    #     print(f"  depth {d}: {depth_counts[d]} pages")
