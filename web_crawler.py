@@ -82,12 +82,10 @@ class DocCrawler:
         self.context = self.browser.new_context(user_agent=config.user_agent)
         self.browser_page = self.context.new_page()
 
-        self.context = self.browser.new_context(user_agent=config.user_agent)
-        self.page = self.context.new_page()
-
         self.visited: set[str] = set()
         self.pages: dict[str, CrawledPage] = {}
         self.assets: dict[str, str] = {}
+        self.failed_assets: set[str] = set()
 
         # Primary boundary: parent directory of start URL
         parsed = urlparse(config.start_url)
@@ -118,12 +116,32 @@ class DocCrawler:
     def normalize_url(self, url: str) -> str:
         """Strip fragment (#section and ? queries) for deduplication."""
         parsed = urlparse(url)
-        if parsed.query:
-            logger.info(f"Query string detected and stripped: '?{parsed.query}' from {url}")
+        path_lower = parsed.path.lower()
+        query = parsed.query
+
+        # List of dynamic paths, where query — is a part of ID content
+        dynamic_markers = ['/repos/asf', 'git', 'viewvc', 'view.php']
+
+        # if the resource is dynamic — cut off only anchor, and keep query
+        if any(m in url.lower() for m in dynamic_markers):
+            if query:
+                return parsed._replace(fragment="").geturl()
+
+        # otherwise the page is static so we cut both query and anchor
+        if query:
+            logger.info(f"Query string detected and stripped: '?{query}' from {url}")
         return parsed._replace(query="", fragment="").geturl()
 
     def is_in_scope(self, url: str) -> bool:
         """Check if URL falls within allowed boundaries and not excluded."""
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+
+        # so that playwright won't break on any first attempt of trying to download file. Might as well try to catch exception, but no
+        forbidden_exts = {'.rss', '.xml', '.pdf', '.zip', '.gz', '.tar', '.jar', '.js', '.css'}
+        if any(path.endswith(ext) for ext in forbidden_exts):
+            return False
+
         for pattern in self.config.exclude_patterns:
             if pattern in url:
                 return False
@@ -176,7 +194,7 @@ class DocCrawler:
         try:
             time.sleep(self.config.delay)
             # go by URL
-            response = self.page.goto(url, wait_until="networkidle", timeout=self.config.timeout * 1000)
+            response = self.browser_page.goto(url, wait_until="networkidle", timeout=self.config.timeout * 1000)
 
             if not response or not response.ok:
                 self.stats.record_skip(url, f"Status: {response.status if response else 'No Response'}")
@@ -199,9 +217,13 @@ class DocCrawler:
 
             return self.browser_page.content(), final_url
 
-        except requests.RequestException as e:
-            self.stats.record_skip(url, str(e))
-            logger.warning(f"Failed to download {url}: {e}")
+        except Exception as e:
+            error_msg = str(e)
+            if "Download is starting" in error_msg:
+                self.stats.record_skip(url, "Filtered: is a download, not a page")
+            else:
+                self.stats.record_skip(url, f"Playwright Error: {error_msg}")
+                logger.warning(f"Failed to download {url}: {e}")
             return None, url
 
     def download_asset(self, url: str) -> bool:
@@ -244,9 +266,13 @@ class DocCrawler:
                 continue
 
             absolute_url = urljoin(page_url, href)
+            # to prevent extra logs from links out of scope but with query parts
+            temp_norm, _ = urldefrag(absolute_url)
+            if not self.is_in_scope(temp_norm):
+                continue
+            # already know that is in scope
             normalized = self.normalize_url(absolute_url)
-            if self.is_in_scope(normalized):
-                results.append((normalized, absolute_url))
+            results.append((normalized, absolute_url))
 
         in_scope_normalized = [r[0] for r in results]
         new_count = sum(1 for u in in_scope_normalized if u not in self.visited)
@@ -360,12 +386,17 @@ class DocCrawler:
                 downloaded = 0
                 cached = 0
                 for asset_url in asset_urls:
-                    if asset_url in self.assets:
-                        cached += 1
-                        page.assets[asset_url] = self.assets[asset_url]
-                    elif self.download_asset(asset_url):
+                    if asset_url in self.assets or asset_url in self.failed_assets:
+                        if asset_url in self.assets:
+                            cached += 1
+                            page.assets[asset_url] = self.assets[asset_url]
+                        continue
+
+                    if self.download_asset(asset_url):
                         downloaded += 1
                         page.assets[asset_url] = self.assets[asset_url]
+                    else:
+                        self.failed_assets.add(asset_url)  # mark as "bad" to not try downloading it over and over again
                 self.stats.record_assets(found=len(asset_urls), downloaded=downloaded, cached=cached)
 
             # Extract links and enqueue new ones
@@ -432,11 +463,33 @@ class DocCrawler:
 
 if __name__ == "__main__":
     config = CrawlConfig(
-        start_url="https://inlong.apache.org/docs/introduction",
-        output_dir="crawled_docs/inlong",
+        start_url="https://johnzon.apache.org/index.html",
+        output_dir="crawled_docs/johnzon",
         max_depth=100,
         download_assets=True,
         delay=0.5,
+        exclude_patterns=[
+            "/apidocs/",  # Самое тяжелое — JavaDoc
+            "/testapidocs/",  # JavaDoc тестов
+            "/xref/",  # Исходный код в HTML
+            "/xref-test/",  # Исходный код тестов
+            "/cobertura/",  # Отчеты о покрытии тестами
+            "/checkstyle",  # Отчеты о качестве кода
+            "/pmd",  # Статический анализ
+            "/dependencies.html",
+            "/dependency-info.html",
+            "/project-info.html",
+            "/project-reports.html",
+            "/plugin-management.html",
+            "/plugins.html",
+            "/team-list.html",
+            "/source-repository.html",
+            "/issue-tracking.html",
+            "/license.html",
+            "/mail-lists.html",
+            "/distribution-management.html",
+            "/summary.html"
+        ],
         #additional_boundaries=["https://javadoc.io/doc/org.apache.shiro"],
     )
 

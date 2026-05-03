@@ -327,37 +327,50 @@ class DocumentationConverter:
 
     def _extract_main_content(self, soup: BeautifulSoup, page_info: dict) -> Optional[Tag]:
         """Extract page body, stripping only scripts and styles."""
-        for el in soup.select('script, style'):
+        for el in soup.select('script, style, noscript'):
             el.decompose()
 
         specific_selector = page_info.get("selector")
+        content = None
+
         if specific_selector:
             content = soup.select_one(specific_selector)
-            if content:
-                text_len = len(content.get_text(strip=True))
-                if text_len >= self.config.min_content_length:
-                    return content
 
-        # fallback
-        selectors = [
-            ('main', {}),
-            ('article', {}),
-            ('div', {'role': 'main'}),
-            ('div', {'class': 'content'}),
-            ('div', {'class': 'document'}),
-            ('div', {'class': 'body'}),
-            ('div', {'id': 'content'}),
-            ('body', {}),
-        ]
+        if not content:
+            fallback_selectors = [
+                'main', 'article', 'div[role="main"]',
+                'div.content', 'div.document', 'div.body', '#content'
+            ]
+            for sel in fallback_selectors:
+                found = soup.select_one(sel)
+                if found and len(found.get_text(strip=True)) >= self.config.min_content_length:
+                    content = found
+                    break
 
-        for tag, attrs in selectors:
-            content = soup.find(tag, **attrs)
-            if content:
-                text = content.get_text(strip=True)
-                if len(text) >= self.config.min_content_length:
-                    return content
+        # # fallback
+        # selectors = [
+        #     ('main', {}),
+        #     ('article', {}),
+        #     ('div', {'role': 'main'}),
+        #     ('div', {'class': 'content'}),
+        #     ('div', {'class': 'document'}),
+        #     ('div', {'class': 'body'}),
+        #     ('div', {'id': 'content'}),
+        #     ('body', {}),
+        # ]
 
-        return None
+        if content:
+            for anchor in content.select('a.hash-link, a.anchor, a.headerlink'):
+                anchor.decompose()
+
+            for button in content.select('button'):
+                if 'copy' in button.get_text().lower() or 'copy' in "".join(button.get('class', [])):
+                    button.decompose()
+            if len(content.get_text(strip=True)) >= self.config.min_content_length:
+                return content
+
+        # if nothing helped -- just take whole body
+        return soup.find('body')
 
     def _dl_to_ul(self, soup: BeautifulSoup, dl_tag: Tag) -> Tag:
         """Convert <dl>/<dt>/<dd> to <ul>/<li> recursively."""
